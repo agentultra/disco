@@ -17,11 +17,39 @@ https://kar.kent.ac.uk/14528/1/monadicAssertions.pdf
 module Lib where
 
 import Control.Monad hiding (fail)
+import Data.IORef
 import Data.Text (Text)
 import Prelude hiding (fail)
+import System.IO.Unsafe
 
-data EvalTree = Eval [EvalTree] | Uneval
-  deriving stock Show
+data EvalTree = Eval [EvalTreeRef] | Uneval (IORef (IO ()))
+
+type EvalTreeRef = IORef EvalTree
+
+mkEvalTreeCons :: EvalTreeRef -> Int -> IO [EvalTreeRef]
+mkEvalTreeCons r n = do refs <- sequence (replicate n emptyUnevalRef)
+                        Uneval aRef <- readIORef r
+                        action <- readIORef aRef
+                        writeIORef r (Eval refs)
+                        action
+                        pure refs
+
+emptyUnevalRef :: IO EvalTreeRef
+emptyUnevalRef = do aRef <- newIORef (pure ())
+                    newIORef (Uneval aRef)
+
+class Observe a where
+  observe :: a -> EvalTreeRef -> a
+
+instance Observe a => Observe [a] where
+  observe (x:xs) r = unsafePerformIO $ do [aRef, bRef] <- mkEvalTreeCons r 2
+                                          pure (observe x aRef : observe xs bRef)
+  observe [] r = unsafePerformIO $ do mkEvalTreeCons r 0
+                                      pure []
+
+mkObserve :: Observe a => a -> IO (EvalTreeRef, a)
+mkObserve x = do r <- emptyUnevalRef
+                 pure (r, observe x r)
 
 newtype Lazy a = Lazy (EvalTree, a)
 
@@ -54,33 +82,31 @@ _              `parConjunction` _              = Suspension
 (&|&) :: Computation Bool -> Computation Bool -> Computation Bool
 (&|&) = parConjunction
 
-newtype Try a = Try [Computation a]
-  deriving stock (Eq, Show)
+type FailCont = IO ()
+type SuccCont a = FailCont -> a -> IO ()
+
+newtype Try a = Try (SuccCont a -> FailCont -> IO ())
 
 deriving instance Functor Try
 
 instance Applicative Try where
-  pure x = Try [Result x]
+  pure x = Try (\sc fc -> sc fc x)
 
   fs <*> xs = do
     f <- fs
     f <$> xs
 
--- TODO (james): simplify in terms of Applicative
 instance Monad Try where
-  (Try as) >>= f = Try $ concatMap (applyResult (fromTry . f)) as
-    where
-      fromTry (Try x) = x
+  (Try asIO) >>= f = Try (\sc fc -> asIO (\sfc x -> fromTry (f x) sc sfc) fc)
 
-      applyResult :: (a -> [Computation b]) -> Computation a -> [Computation b]
-      applyResult g (Result x) = g x
-      applyResult _ Suspension = [Suspension]
+fromTry (Try x) = x
 
 fail :: Try a
-fail = Try []
+fail = Try (\sc fc -> fc)
 
-suspend :: Try a
-suspend = Try [Suspension]
+suspend :: IORef (IO ()) -> Try a -> SuccCont a -> FailCont -> IO ()
+suspend aRef try sc fc = do io <- readIORef aRef
+                            writeIORef aRef (io >> (fromTry try) sc fc)
 
 parDisjunction :: Try a -> Try a -> Try a
 (Try xs) `parDisjunction` (Try ys) = Try (xs ++ ys)
@@ -89,13 +115,14 @@ parDisjunction :: Try a -> Try a -> Try a
 (|||) = parDisjunction
 
 nil :: Lazy [a] -> Try ()
-nil (Lazy (Eval _, v)) = unless (null v) fail
-nil (Lazy (Uneval, _)) = suspend
+nil (Lazy (Eval _, [])) = pure ()
+nil (Lazy (Eval _, _:_)) = fail
+nil rx@(Lazy (Uneval aRef, v)) = Try (suspend aRef (nil rx))
 
 cons :: Lazy [a] -> Try (Lazy a, Lazy [a])
 cons (Lazy (Eval [subTermX, subTermY], x:xs)) = pure (Lazy (subTermX, x), Lazy (subTermY, xs))
-cons (Lazy (Eval _, _)) = fail
-cons (Lazy (Uneval, _)) = suspend
+cons (Lazy (Eval _, [])) = fail
+cons rx@(Lazy (Uneval aRef, v)) = Try $ suspend aRef (cons rx)
 
 val :: Lazy a -> Try a
 val (Lazy (subTerm, v)) = condEval subTerm (pure v)
