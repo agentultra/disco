@@ -22,5 +22,6 @@ instance Arbitrary a => Arbitrary (Try a) where
 main :: IO ()
 main = do
   lawsCheck (applicativeLaws (Proxy :: Proxy Computation))
+  lawsCheck (monadLaws (Proxy :: Proxy Computation))
   lawsCheck (applicativeLaws (Proxy :: Proxy Try))
   lawsCheck (monadLaws (Proxy :: Proxy Try))

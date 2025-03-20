@@ -1,5 +1,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DerivingStrategies #-}
@@ -35,6 +36,10 @@ instance Applicative Computation where
   Suspension <*> _          = Suspension
 
 deriving instance Functor Computation
+
+instance Monad Computation where
+  (Result x) >>= f = f x
+  Suspension >>= _ = Suspension
 
 leq :: Lazy Int -> Lazy Int -> Maybe Bool
 leq (Lazy (Eval [], x)) (Lazy (Eval [], y)) = Just $ x <= y
@@ -94,10 +99,27 @@ cons (Lazy (Uneval, _)) = suspend
 
 val :: Lazy a -> Try a
 val (Lazy (subTerm, v)) = condEval subTerm (pure v)
+  where
+    condEval :: EvalTree -> Try a -> Try a
+    condEval (Eval st) termValue = foldr condEval termValue st
+    condEval Uneval _ = suspend
 
-condEval :: EvalTree -> a -> a
-condEval (Eval subTerm) termValue = foldr condEval termValue subTerm
-condEval Uneval _ = suspend
+parApply :: Try (a -> b) -> Try a -> Try b
+parApply (Try fs) (Try xs) = Try [ res
+                                 | fRes <- fs, xRes <- xs,
+                                   let res = do f <- fRes
+                                                f <$> xRes
+                                 ]
+(***) :: Try (a -> b) -> Try a -> Try b
+(***) = parApply
+
+type Assert = Try ()
+
+parConj :: Assert -> Assert -> Assert
+evalTreeX `parConj` evalTreeY = (pure (\_ _ -> ()) *** evalTreeX) *** evalTreeY
+
+(&&&) :: Assert -> Assert -> Assert
+(&&&) = parConj
 
 assert :: Text -> (Lazy a -> Try ()) -> a -> a
 assert = undefined
