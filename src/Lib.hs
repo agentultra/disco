@@ -1,3 +1,5 @@
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DerivingStrategies #-}
@@ -13,7 +15,9 @@ https://kar.kent.ac.uk/14528/1/monadicAssertions.pdf
 
 module Lib where
 
+import Control.Monad hiding (fail)
 import Data.Text (Text)
+import Prelude hiding (fail)
 
 data EvalTree = Eval [EvalTree] | Uneval
   deriving stock Show
@@ -64,13 +68,13 @@ instance Monad Try where
       fromTry (Try x) = x
 
       applyResult :: (a -> [Computation b]) -> Computation a -> [Computation b]
-      applyResult f (Result x) = f x
-      applyResult f Suspension = [Suspension]
+      applyResult g (Result x) = g x
+      applyResult _ Suspension = [Suspension]
 
-fail :: Try ()
+fail :: Try a
 fail = Try []
 
-suspend :: Try ()
+suspend :: Try a
 suspend = Try [Suspension]
 
 parDisjunction :: Try a -> Try a -> Try a
@@ -80,13 +84,20 @@ parDisjunction :: Try a -> Try a -> Try a
 (|||) = parDisjunction
 
 nil :: Lazy [a] -> Try ()
-nil = undefined
+nil (Lazy (Eval _, v)) = unless (null v) fail
+nil (Lazy (Uneval, _)) = suspend
 
 cons :: Lazy [a] -> Try (Lazy a, Lazy [a])
-cons = undefined
+cons (Lazy (Eval [subTermX, subTermY], x:xs)) = pure (Lazy (subTermX, x), Lazy (subTermY, xs))
+cons (Lazy (Eval _, _)) = fail
+cons (Lazy (Uneval, _)) = suspend
 
 val :: Lazy a -> Try a
-val = undefined
+val (Lazy (subTerm, v)) = condEval subTerm (pure v)
+
+condEval :: EvalTree -> a -> a
+condEval (Eval subTerm) termValue = foldr condEval termValue subTerm
+condEval Uneval _ = suspend
 
 assert :: Text -> (Lazy a -> Try ()) -> a -> a
 assert = undefined
