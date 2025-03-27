@@ -18,16 +18,15 @@ module Lib where
 
 import Control.Monad hiding (fail)
 import Data.IORef
-import Data.Text (Text)
 import Prelude hiding (fail)
 import System.IO.Unsafe
 
-data EvalTree = Eval [EvalTreeRef] | Uneval (IORef (IO ()))
+data EvalTree = Eval [IORef EvalTree] | Uneval (IORef (IO ()))
 
 type EvalTreeRef = IORef EvalTree
 
 mkEvalTreeCons :: EvalTreeRef -> Int -> IO [EvalTreeRef]
-mkEvalTreeCons r n = do refs <- sequence (replicate n emptyUnevalRef)
+mkEvalTreeCons r n = do refs <- replicateM n emptyUnevalRef
                         Uneval aRef <- readIORef r
                         action <- readIORef aRef
                         writeIORef r (Eval refs)
@@ -44,14 +43,14 @@ class Observe a where
 instance Observe a => Observe [a] where
   observe (x:xs) r = unsafePerformIO $ do [aRef, bRef] <- mkEvalTreeCons r 2
                                           pure (observe x aRef : observe xs bRef)
-  observe [] r = unsafePerformIO $ do mkEvalTreeCons r 0
+  observe [] r = unsafePerformIO $ do _ <- mkEvalTreeCons r 0
                                       pure []
 
 mkObserve :: Observe a => a -> IO (EvalTreeRef, a)
 mkObserve x = do r <- emptyUnevalRef
                  pure (r, observe x r)
 
-newtype Lazy a = Lazy (EvalTree, a)
+newtype Lazy a = Lazy (EvalTreeRef, a)
 
 data Computation a = Result a | Suspension
   deriving stock (Eq, Show)
@@ -68,10 +67,6 @@ deriving instance Functor Computation
 instance Monad Computation where
   (Result x) >>= f = f x
   Suspension >>= _ = Suspension
-
-leq :: Lazy Int -> Lazy Int -> Maybe Bool
-leq (Lazy (Eval [], x)) (Lazy (Eval [], y)) = Just $ x <= y
-leq _ _                                     = Nothing
 
 parConjunction :: Computation Bool -> Computation Bool -> Computation Bool
 (Result True)  `parConjunction` (Result True)  = Result True
@@ -99,44 +94,47 @@ instance Applicative Try where
 instance Monad Try where
   (Try asIO) >>= f = Try (\sc fc -> asIO (\sfc x -> fromTry (f x) sc sfc) fc)
 
+fromTry :: Try a -> SuccCont a -> FailCont -> IO ()
 fromTry (Try x) = x
 
 fail :: Try a
-fail = Try (\sc fc -> fc)
+fail = Try (\_ fc -> fc)
 
 suspend :: IORef (IO ()) -> Try a -> SuccCont a -> FailCont -> IO ()
 suspend aRef try sc fc = do io <- readIORef aRef
-                            writeIORef aRef (io >> (fromTry try) sc fc)
+                            writeIORef aRef (io >> fromTry try sc fc)
 
 parDisjunction :: Try a -> Try a -> Try a
-(Try xs) `parDisjunction` (Try ys) = Try (xs ++ ys)
+(Try x) `parDisjunction` (Try y) = Try $ \sc fc -> do
+  ref <- newIORef True
+  x sc (orIORef ref fc) >> y sc (orIORef ref fc)
+
+orIORef :: IORef Bool -> FailCont -> IO ()
+orIORef ref fc = do v <- readIORef ref
+                    if v then writeIORef ref False
+                      else fc
 
 (|||) :: Try a -> Try a -> Try a
 (|||) = parDisjunction
 
-nil :: Lazy [a] -> Try ()
-nil (Lazy (Eval _, [])) = pure ()
-nil (Lazy (Eval _, _:_)) = fail
-nil rx@(Lazy (Uneval aRef, v)) = Try (suspend aRef (nil rx))
-
-cons :: Lazy [a] -> Try (Lazy a, Lazy [a])
-cons (Lazy (Eval [subTermX, subTermY], x:xs)) = pure (Lazy (subTermX, x), Lazy (subTermY, xs))
-cons (Lazy (Eval _, [])) = fail
-cons rx@(Lazy (Uneval aRef, v)) = Try $ suspend aRef (cons rx)
-
-val :: Lazy a -> Try a
-val (Lazy (subTerm, v)) = condEval subTerm (pure v)
-  where
-    condEval :: EvalTree -> Try a -> Try a
-    condEval (Eval st) termValue = foldr condEval termValue st
-    condEval Uneval _ = suspend
-
 parApply :: Try (a -> b) -> Try a -> Try b
-parApply (Try fs) (Try xs) = Try [ res
-                                 | fRes <- fs, xRes <- xs,
-                                   let res = do f <- fRes
-                                                f <$> xRes
-                                 ]
+parApply (Try f) (Try x) = Try $ \sc fc -> do
+  fRef <- newIORef []
+  xRef <- newIORef []
+  ref <- newIORef True
+  f (\ffc f' -> do modifyIORef fRef ((ffc, f'):)
+                   xs <- readIORef xRef
+                   mapM_ (\(xfc, x') -> sc (ffc >> xfc) (f' x')) xs)
+    (andIORef ref fc)
+  x (\xfc x' -> do modifyIORef xRef ((xfc, x'):)
+                   fs <- readIORef fRef
+                   mapM_ (\(ffc, f') -> sc (ffc >> xfc) (f' x')) fs)
+    (andIORef ref fc)
+
+andIORef :: IORef Bool -> IO () -> IO ()
+andIORef ref fc = do v <- readIORef ref
+                     when v $ writeIORef ref False >> fc
+
 (***) :: Try (a -> b) -> Try a -> Try b
 (***) = parApply
 
@@ -148,5 +146,10 @@ evalTreeX `parConj` evalTreeY = (pure (\_ _ -> ()) *** evalTreeX) *** evalTreeY
 (&&&) :: Assert -> Assert -> Assert
 (&&&) = parConj
 
-assert :: Text -> (Lazy a -> Try ()) -> a -> a
-assert = undefined
+assert :: Observe a => String -> (Lazy a -> Assert) -> a -> a
+assert label p x = unsafePerformIO $ do
+  (eT, x') <- mkObserve x
+  let Try check = p $ Lazy (eT, x')
+  check (\_ _ -> putStrLn $ "Assertion passed: " ++ label)
+        (error $ "Assertion failed: " ++ label)
+  pure x
